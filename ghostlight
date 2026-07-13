@@ -1,0 +1,841 @@
+#!/usr/bin/env python3
+"""ghostlight — Ghostty tab status dots for Claude Code sessions.
+
+Single-file CLI.
+"""
+import argparse
+import copy
+import fcntl
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import traceback
+from datetime import datetime, timezone
+from pathlib import Path
+
+DOTS = {"waiting": "🟠", "compacting": "🔵", "working": "🟢", "idle": "⚪"}
+PRIORITY = ["waiting", "compacting", "working", "idle"]
+# TTL measures event silence (mtime = last hook event). working/compacting
+# sessions emit events constantly, so 12h of silence means dead or wedged.
+# idle and waiting sessions are legitimately silent for arbitrarily long
+# (idle = nothing happening; waiting = permission prompt unanswered), so
+# they get no / a much longer TTL. None = never swept by age.
+TTL_SECONDS = 12 * 3600
+STATE_TTLS = {"idle": None, "waiting": 7 * 24 * 3600}
+OSA_TIMEOUT = 5
+US = chr(31)  # field separator in AppleScript output
+RS = chr(30)  # record separator in AppleScript output
+# transient title written during identity capture: ghostlight-<sid8>-<pid>
+NONCE_RE = re.compile(r"ghostlight-[^ ]+-\d+$")
+
+# hook subcommand -> session state (session-start / session-end are special-cased)
+EVENT_STATE = {
+    "user-prompt-submit": "working",
+    "pretooluse": "working",
+    "postcompact": "working",
+    "notification": "waiting",
+    "precompact": "compacting",
+    "stop": "idle",
+}
+
+# (Claude Code event name, matcher or None, ghostlight hook subcommand)
+HOOK_EVENTS = [
+    ("SessionStart", None, "session-start"),
+    ("UserPromptSubmit", None, "user-prompt-submit"),
+    ("PreToolUse", None, "pretooluse"),
+    ("Notification", "permission_prompt", "notification"),
+    ("PreCompact", None, "precompact"),
+    ("PostCompact", None, "postcompact"),
+    ("Stop", None, "stop"),
+    ("SessionEnd", None, "session-end"),
+]
+
+
+def state_dir():
+    return Path(os.environ.get(
+        "GHOSTLIGHT_STATE_DIR", os.path.expanduser("~/.local/state/ghostlight")))
+
+
+def status_dir():
+    return state_dir() / "status"
+
+
+def lock_path():
+    return state_dir() / "update.lock"
+
+
+def dirty_path():
+    return state_dir() / "dirty"
+
+
+def log_path():
+    return state_dir() / "ghostlight.log"
+
+
+def settings_path():
+    return Path(os.environ.get(
+        "GHOSTLIGHT_SETTINGS", os.path.expanduser("~/.claude/settings.json")))
+
+
+def script_path():
+    return os.path.abspath(__file__)
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def log(msg):
+    try:
+        state_dir().mkdir(parents=True, exist_ok=True)
+        p = log_path()
+        if p.exists() and p.stat().st_size > 1_000_000:
+            p.replace(p.with_name(p.name + ".old"))
+        with open(p, "a") as f:
+            f.write(f"{now_iso()} [{os.getpid()}] {msg}\n")
+    except Exception:
+        pass
+
+
+def strip_known_dot(name):
+    for dot in DOTS.values():
+        if name.startswith(dot + " "):
+            return name[len(dot) + 1:]
+        if name == dot:
+            return ""
+    return name
+
+
+def make_title(state, current_name):
+    base = strip_known_dot(current_name)
+    if state is None:
+        return base
+    return f"{DOTS[state]} {base}"
+
+
+def worst_state(states):
+    present = set(states)
+    for s in PRIORITY:
+        if s in present:
+            return s
+    return None
+
+
+def _atomic_write_json(path, data):
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=1))
+    os.replace(tmp, path)
+
+
+def write_status(entry):
+    status_dir().mkdir(parents=True, exist_ok=True)
+    path = status_dir() / f"{entry['tab_id']}__{entry['session_id']}.json"
+    _atomic_write_json(path, entry)
+    return path
+
+
+def read_status_files():
+    out = []
+    if not status_dir().is_dir():
+        return out
+    for p in sorted(status_dir().glob("*.json")):
+        try:
+            d = json.loads(p.read_text())
+        except (json.JSONDecodeError, OSError):
+            log(f"deleting corrupt status file: {p.name}")
+            p.unlink(missing_ok=True)
+            continue
+        d["_path"] = p
+        out.append(d)
+    return out
+
+
+def find_session_files(session_id):
+    if not status_dir().is_dir():
+        return []
+    return sorted(status_dir().glob(f"*__{session_id}.json"))
+
+
+def update_session_state(session_id, state):
+    changed = False
+    for p in find_session_files(session_id):
+        try:
+            d = json.loads(p.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if d.get("state") == state:
+            try:
+                os.utime(p)  # reset the TTL silence clock on every event
+            except OSError:
+                pass
+            continue
+        d["state"] = state
+        d["updated_at"] = now_iso()
+        _atomic_write_json(p, d)
+        changed = True
+    return changed
+
+
+def delete_session(session_id):
+    for p in find_session_files(session_id):
+        p.unlink(missing_ok=True)
+
+
+def sweep_ttl():
+    if not status_dir().is_dir():
+        return
+    now = time.time()
+    for p in status_dir().glob("*.json"):
+        try:
+            age = now - p.stat().st_mtime
+            if age < TTL_SECONDS:  # TTL_SECONDS is the shortest tier
+                continue
+            try:
+                state = json.loads(p.read_text()).get("state")
+            except (ValueError, OSError, AttributeError):
+                state = None  # unreadable and old: sweep
+            ttl = STATE_TTLS.get(state, TTL_SECONDS)
+            if ttl is None or age < ttl:
+                continue
+            p.unlink()
+            log(f"TTL sweep removed {p.name} (state={state}, age={int(age)}s)")
+        except OSError:
+            pass
+
+
+def run_update_pass():
+    sweep_ttl()
+    entries = read_status_files()
+    by_tab = {}
+    for e in entries:
+        by_tab.setdefault(e.get("tab_id", ""), []).append(e)
+    tabs = enumerate_tabs()
+    if tabs is None:
+        return
+    seen = set()
+    for t in tabs:
+        seen.add(t["tab_id"])
+        name = t["name"]
+        if NONCE_RE.match(name) or not strip_known_dot(name).strip():
+            continue
+        states = [e.get("state", "") for e in by_tab.get(t["tab_id"], [])]
+        desired = make_title(worst_state(states), name)
+        if desired != name:
+            set_tab_title(t["terminal_id"], desired)
+    for e in entries:
+        if e.get("tab_id") not in seen:
+            try:
+                e["_path"].unlink(missing_ok=True)
+                log(f"stale (tab gone): removed {e['_path'].name}")
+            except OSError:
+                pass
+
+
+def clear_all_dots():
+    # Uninstall-time cleanup: with the hooks gone no pass will ever strip
+    # dots again, so leaving them would freeze stale state onto tab titles.
+    tabs = enumerate_tabs()
+    if not tabs:
+        return
+    for t in tabs:
+        base = strip_known_dot(t["name"])
+        if base != t["name"] and base.strip():
+            set_tab_title(t["terminal_id"], base)
+
+
+def cmd_update(pass_fn=None):
+    if pass_fn is None:
+        pass_fn = run_update_pass
+    state_dir().mkdir(parents=True, exist_ok=True)
+    dirty_path().touch()
+    while True:
+        lock = open(lock_path(), "w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            lock.close()
+            return 0
+        try:
+            while dirty_path().exists():
+                dirty_path().unlink(missing_ok=True)
+                try:
+                    pass_fn()
+                except Exception:
+                    log(f"update pass failed: {traceback.format_exc()}")
+                    break
+        finally:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+            finally:
+                lock.close()
+        if not dirty_path().exists():
+            return 0
+
+
+ENUMERATE_SCRIPT = '''
+set us to character id 31
+set rs to character id 30
+set out to ""
+tell application "Ghostty"
+  repeat with w in windows
+    repeat with tb in tabs of w
+      set out to out & (id of tb) & us & (id of first terminal of tb) & us & (name of tb) & rs
+    end repeat
+  end repeat
+end tell
+return out
+'''
+
+SET_TITLE_SCRIPT = '''
+on run argv
+  tell application "Ghostty"
+    perform action ("set_tab_title:" & (item 2 of argv)) on terminal id (item 1 of argv)
+  end tell
+end run
+'''
+
+FIND_BY_NAME_SCRIPT = '''
+on run argv
+  set us to character id 31
+  tell application "Ghostty"
+    repeat with w in windows
+      repeat with tb in tabs of w
+        repeat with tm in terminals of tb
+          if (name of tm) is (item 1 of argv) then
+            return (id of tm) & us & (id of tb)
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return ""
+end run
+'''
+
+FIND_BY_CWD_SCRIPT = '''
+on run argv
+  set us to character id 31
+  set matches to {}
+  tell application "Ghostty"
+    repeat with w in windows
+      repeat with tb in tabs of w
+        repeat with tm in terminals of tb
+          if (working directory of tm) is (item 1 of argv) then
+            set end of matches to (id of tm) & us & (id of tb)
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  if (count of matches) is 1 then return item 1 of matches
+  return ""
+end run
+'''
+
+FRONT_WINDOW_SCRIPT = '''
+on run argv
+  set us to character id 31
+  tell application "Ghostty"
+    set tb to selected tab of front window
+    set tm to focused terminal of tb
+    if (working directory of tm) is (item 1 of argv) then
+      return (id of tm) & us & (id of tb)
+    end if
+  end tell
+  return ""
+end run
+'''
+
+
+def run_osascript(script, *args):
+    try:
+        r = subprocess.run(["osascript", "-", *args], input=script,
+                           capture_output=True, text=True, timeout=OSA_TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError):
+        log("osascript timed out or failed to launch")
+        return None
+    if r.returncode != 0:
+        log(f"osascript error: {r.stderr.strip()}")
+        return None
+    return r.stdout.rstrip("\n")
+
+
+def ghostty_running():
+    try:
+        r = subprocess.run(["ps", "-axo", "comm="],
+                           capture_output=True, text=True, timeout=OSA_TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return any(line.strip().endswith("/Ghostty.app/Contents/MacOS/ghostty")
+               for line in r.stdout.splitlines())
+
+
+def enumerate_tabs():
+    if not ghostty_running():
+        return None
+    out = run_osascript(ENUMERATE_SCRIPT)
+    if out is None:
+        return None
+    tabs = []
+    for rec in out.split(RS):
+        if not rec:
+            continue
+        parts = rec.split(US)
+        if len(parts) < 3:
+            log(f"enumerate_tabs: dropping malformed record {rec!r}")
+            continue
+        tabs.append({"tab_id": parts[0], "terminal_id": parts[1],
+                     "name": US.join(parts[2:])})
+    return tabs
+
+
+def set_tab_title(terminal_id, title):
+    if not ghostty_running():
+        return False
+    return run_osascript(SET_TITLE_SCRIPT, terminal_id, title) is not None
+
+
+def find_tty():
+    pid = os.getpid()
+    for _ in range(15):
+        try:
+            out = subprocess.run(["ps", "-o", "ppid=,tty=", "-p", str(pid)],
+                                 capture_output=True, text=True,
+                                 timeout=OSA_TIMEOUT).stdout.split()
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        if len(out) < 2:
+            return None
+        ppid, tty = out[0], out[1]
+        if tty not in ("??", "-", ""):
+            return "/dev/" + tty
+        if ppid in ("0", "1"):
+            return None
+        pid = ppid
+    return None
+
+
+def write_title_escape(tty_path, text):
+    fd = os.open(tty_path, os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK)
+    try:
+        os.write(fd, b"\x1b]2;" + text.encode("utf-8", "replace") + b"\x07")
+    finally:
+        os.close(fd)
+
+
+def resolve_identity(cwd, session_id):
+    if not ghostty_running():
+        log("resolve_identity: Ghostty not running")
+        return None
+    tty = find_tty()
+    if tty:
+        nonce = f"ghostlight-{session_id[:8]}-{os.getpid()}"
+        found = None
+        try:
+            for _ in range(3):
+                write_title_escape(tty, nonce)
+                time.sleep(0.15)
+                found = run_osascript(FIND_BY_NAME_SCRIPT, nonce)
+                if found:
+                    break
+        except OSError:
+            log(f"nonce write to {tty} failed")
+            found = None
+        try:
+            write_title_escape(tty, "")
+        except OSError:
+            pass
+        if found and US in found:
+            term_id, tab_id = found.split(US, 1)
+            return term_id, tab_id
+    for script in (FIND_BY_CWD_SCRIPT, FRONT_WINDOW_SCRIPT):
+        found = run_osascript(script, cwd)
+        if found and US in found:
+            term_id, tab_id = found.split(US, 1)
+            return term_id, tab_id
+    return None
+
+
+def spawn_update():
+    state_dir().mkdir(parents=True, exist_ok=True)
+    with open(log_path(), "ab") as lf:
+        subprocess.Popen([sys.executable, script_path(), "update"],
+                         stdin=subprocess.DEVNULL, stdout=lf, stderr=lf,
+                         start_new_session=True)
+
+
+def adopt_session(session_id, cwd, state):
+    resolved = resolve_identity(cwd, session_id)
+    if not resolved:
+        return False
+    term_id, tab_id = resolved
+    for p in find_session_files(session_id):
+        if not p.name.startswith(tab_id + "__"):
+            p.unlink(missing_ok=True)
+    write_status({"session_id": session_id, "tab_id": tab_id,
+                  "terminal_id": term_id, "cwd": cwd,
+                  "state": state, "updated_at": now_iso()})
+    return True
+
+
+def handle_session_start(session_id, cwd, source=""):
+    # Only compaction resumes work mid-turn; startup/resume/clear all land
+    # at an empty prompt, i.e. idle until the first UserPromptSubmit.
+    state = "working" if source == "compact" else "idle"
+    if source in ("compact", "clear") and find_session_files(session_id):
+        update_session_state(session_id, state)
+        return True
+    if adopt_session(session_id, cwd, state):
+        return True
+    if update_session_state(session_id, state):
+        return True
+    log(f"session-start: no terminal resolved for {session_id}; running dot-less")
+    return False
+
+
+def _hook_impl(event):
+    try:
+        # a tty stdin means a human ran `ghostlight hook X` by hand;
+        # json.load would hang waiting for EOF
+        payload = {} if sys.stdin.isatty() else json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        payload = {}
+    session_id = payload.get("session_id") or ""
+    cwd = payload.get("cwd") or ""
+    if not session_id:
+        return
+    if event == "session-start":
+        handle_session_start(session_id, cwd, payload.get("source") or "")
+        spawn_update()
+    elif event == "session-end":
+        delete_session(session_id)
+        spawn_update()
+    else:
+        state = EVENT_STATE.get(event)
+        if not state:
+            return
+        if update_session_state(session_id, state):
+            spawn_update()
+        elif event != "pretooluse" and not find_session_files(session_id):
+            # Status file lost while the session lives (e.g. TTL-swept):
+            # re-adopt so any wrongly removed dot heals on the next event.
+            # pretooluse is excluded — it fires per tool call, too hot to
+            # retry identity resolution for sessions that can't resolve.
+            if adopt_session(session_id, cwd, state):
+                spawn_update()
+
+
+def cmd_hook(event):
+    try:
+        _hook_impl(event)
+    except Exception:
+        log(f"hook {event} failed: {traceback.format_exc()}")
+    return 0
+
+
+def _is_our_hook(command):
+    # tolerant of shlex-quoted paths (e.g. '/My Proj/ghostlight' hook stop);
+    # "agentdots" is the project's pre-rename name, matched so that
+    # install/uninstall migrate legacy stanzas instead of orphaning them
+    return (" hook " in command
+            and ("ghostlight" in command or "agentdots" in command))
+
+
+def hook_command_paths(settings):
+    """Unique executable paths from our installed hook commands."""
+    paths = set()
+    try:
+        for stanzas in settings.get("hooks", {}).values():
+            for stanza in stanzas:
+                for h in stanza.get("hooks", []):
+                    cmd = h.get("command", "")
+                    if not _is_our_hook(cmd):
+                        continue
+                    try:
+                        paths.add(shlex.split(cmd)[0])
+                    except (ValueError, IndexError):
+                        pass
+    except (TypeError, AttributeError):
+        pass
+    return sorted(paths)
+
+
+def remove_hooks(settings):
+    settings = copy.deepcopy(settings)
+    hooks = settings.get("hooks", {})
+    for event in list(hooks.keys()):
+        kept = []
+        for stanza in hooks[event]:
+            remaining = [h for h in stanza.get("hooks", [])
+                         if not _is_our_hook(h.get("command", ""))]
+            if remaining:
+                kept.append({**stanza, "hooks": remaining})
+        if kept:
+            hooks[event] = kept
+        else:
+            del hooks[event]
+    if "hooks" in settings and not settings["hooks"]:
+        del settings["hooks"]
+    return settings
+
+
+def merge_hooks(settings, cmd_path):
+    settings = remove_hooks(settings)
+    hooks = settings.setdefault("hooks", {})
+    for event, matcher, sub in HOOK_EVENTS:
+        stanza = {"hooks": [{"type": "command",
+                             "command": f"{shlex.quote(cmd_path)} hook {sub}"}]}
+        if matcher:
+            stanza["matcher"] = matcher
+        hooks.setdefault(event, []).append(stanza)
+    return settings
+
+
+def ghostty_version():
+    for app in ("/Applications/Ghostty.app",
+                os.path.expanduser("~/Applications/Ghostty.app")):
+        try:
+            r = subprocess.run(
+                ["defaults", "read", app + "/Contents/Info.plist",
+                 "CFBundleShortVersionString"],
+                capture_output=True, text=True, timeout=OSA_TIMEOUT)
+            if r.returncode == 0:
+                return tuple(int(x) for x in r.stdout.strip().split(".")[:3])
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            pass
+    try:
+        r = subprocess.run(["ghostty", "+version"],
+                           capture_output=True, text=True, timeout=OSA_TIMEOUT)
+        m = re.search(r"version\s*:\s*(\d+)\.(\d+)\.(\d+)", r.stdout)
+        if m:
+            return tuple(int(x) for x in m.groups())
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    # Last resort: ask the app itself. Guarded by ghostty_running() because
+    # osascript would otherwise *launch* Ghostty just to answer.
+    if ghostty_running():
+        out = run_osascript('tell application "Ghostty" to get version')
+        m = re.search(r"(\d+)\.(\d+)\.(\d+)", out or "")
+        if m:
+            return tuple(int(x) for x in m.groups())
+    return None
+
+
+def _read_settings_or_none():
+    sp = settings_path()
+    if not sp.exists():
+        return {}
+    try:
+        return json.loads(sp.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"error: {sp} is unreadable or invalid JSON ({e}); "
+              "fix it, then re-run", file=sys.stderr)
+        return None
+
+
+def _write_settings(settings):
+    sp = settings_path()
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    # keep the first backup forever: it is the only pre-ghostlight copy;
+    # later installs would overwrite it with settings our hooks are in
+    backup = sp.with_name(sp.name + ".ghostlight-backup")
+    if sp.exists() and not backup.exists():
+        shutil.copy2(sp, backup)
+    tmp = sp.with_name(sp.name + ".tmp")
+    tmp.write_text(json.dumps(settings, indent=2) + "\n")
+    os.replace(tmp, sp)
+
+
+def cmd_install():
+    settings = _read_settings_or_none()
+    if settings is None:
+        return 1
+    try:
+        _write_settings(merge_hooks(settings, script_path()))
+    except (TypeError, AttributeError) as e:
+        print(f"error: {settings_path()} has an unexpected hooks structure ({e}); "
+              "fix it, then re-run", file=sys.stderr)
+        return 1
+    status_dir().mkdir(parents=True, exist_ok=True)
+    ver = ghostty_version()
+    if ver is None:
+        print("warning: could not determine Ghostty version (need >= 1.3.1)")
+    elif ver < (1, 3, 1):
+        print(f"warning: Ghostty {'.'.join(map(str, ver))} < 1.3.1 — "
+              "set_tab_title is unavailable; dots will not work")
+    if ghostty_running():
+        if run_osascript('tell application "Ghostty" to get version') is None:
+            print("warning: Automation permission not granted — approve the "
+                  "macOS prompt, then run `ghostlight doctor`")
+    else:
+        print("note: Ghostty is not running — launch it and run "
+              "`ghostlight doctor` to complete the one-time Automation "
+              "permission grant")
+    print(f"hooks installed into {settings_path()}")
+    print("note: Claude Code sessions already running won't emit events "
+          "until restarted")
+    return 0
+
+
+def cmd_uninstall(purge=False):
+    settings = _read_settings_or_none()
+    if settings is None:
+        return 1
+    try:
+        _write_settings(remove_hooks(settings))
+    except (TypeError, AttributeError) as e:
+        print(f"error: {settings_path()} has an unexpected hooks structure ({e}); "
+              "fix it, then re-run", file=sys.stderr)
+        return 1
+    clear_all_dots()
+    if purge and state_dir().exists():
+        shutil.rmtree(state_dir(), ignore_errors=True)
+    print(f"ghostlight hooks removed from {settings_path()}"
+          + (" and state purged" if purge else ""))
+    return 0
+
+
+def cmd_status():
+    entries = read_status_files()
+    if not entries:
+        print("no active sessions")
+        return 0
+    tabs = enumerate_tabs() or []
+    names = {t["tab_id"]: t["name"] for t in tabs}
+    now = time.time()
+    for e in entries:
+        state = e.get("state", "?")
+        dot = DOTS.get(state, "?")
+        try:
+            age = int(now - e["_path"].stat().st_mtime)
+        except OSError:
+            age = "?"
+        tab_name = names.get(e.get("tab_id"), "<tab not found>")
+        print(f"{dot} {state:<10} sess={e.get('session_id', '?')[:8]:<8} "
+              f"tab={e.get('tab_id', '?'):<14} \"{tab_name}\" "
+              f"({age}s ago) {e.get('cwd', '')}")
+    return 0
+
+
+def cmd_doctor():
+    ok = True
+
+    def check(label, good, hint=""):
+        nonlocal ok
+        mark = "✓" if good else "✗"
+        suffix = f" — {hint}" if (hint and not good) else ""
+        print(f"{mark} {label}{suffix}")
+        if not good:
+            ok = False
+
+    ver = ghostty_version()
+    ver_str = ".".join(map(str, ver)) if ver else "unknown"
+    check(f"Ghostty version {ver_str} >= 1.3.1",
+          ver is not None and ver >= (1, 3, 1))
+
+    try:
+        settings = json.loads(settings_path().read_text())
+    except (OSError, json.JSONDecodeError):
+        settings = {}
+    try:
+        hooks_cfg = settings.get("hooks", {})
+        wanted = {(ev, matcher) for ev, matcher, _ in HOOK_EVENTS}
+        present = {
+            (ev, matcher)
+            for ev, matcher, _ in HOOK_EVENTS
+            for st in hooks_cfg.get(ev, [])
+            if st.get("matcher") == matcher
+            and any(_is_our_hook(h.get("command", "")) for h in st.get("hooks", []))
+        }
+    except (TypeError, AttributeError):
+        check(f"hook stanzas in {settings_path()} (unreadable structure)",
+              False, "run `ghostlight install`")
+    else:
+        check(f"hook stanzas in {settings_path()} "
+              f"({len(present)}/{len(wanted)} hooks)",
+              present == wanted, "run `ghostlight install`")
+
+    # Stanzas can be present yet dead (repo moved/renamed since install),
+    # which otherwise fails silently while doctor looks green.
+    for p in hook_command_paths(settings):
+        check(f"hook command runnable ({p})",
+              os.path.isfile(p) and os.access(p, os.X_OK),
+              "path is stale — run `ghostlight install` from the current "
+              "checkout")
+        if (os.path.isfile(p)
+                and os.path.realpath(p) != os.path.realpath(script_path())):
+            print(f"  note: hooks run {p}, not this copy ({script_path()})")
+
+    try:
+        status_dir().mkdir(parents=True, exist_ok=True)
+        probe = status_dir() / ".doctor-probe"
+        probe.write_text("x")
+        probe.unlink()
+        check(f"state dir writable ({state_dir()})", True)
+    except OSError:
+        check(f"state dir writable ({state_dir()})", False)
+
+    running = ghostty_running()
+    check("Ghostty running", running, "launch Ghostty to verify automation")
+    if running:
+        check("Automation permission (osascript -> Ghostty)",
+              run_osascript('tell application "Ghostty" to get version')
+              is not None,
+              "System Settings > Privacy & Security > Automation")
+    return 0 if ok else 1
+
+
+def main(argv=None):
+    args_list = sys.argv[1:] if argv is None else argv
+    # Real hook invocations must never exit non-zero (Claude Code treats
+    # exit 2 as blocking); flags (e.g. `hook -h`) fall through to argparse.
+    if (args_list and args_list[0] == "hook"
+            and not (len(args_list) > 1 and args_list[1].startswith("-"))):
+        if len(args_list) == 2 and args_list[1] in {s for _, _, s in HOOK_EVENTS}:
+            return cmd_hook(args_list[1])
+        log(f"ignoring unknown hook invocation: {args_list!r}")
+        return 0
+    parser = argparse.ArgumentParser(
+        prog="ghostlight",
+        description="Ghostty tab status dots for Claude Code sessions")
+    # hook/update are registered without help= and kept out of the metavar so
+    # they don't clutter --help; they remain fully functional.
+    sub = parser.add_subparsers(dest="command", required=True,
+                                metavar="{install,uninstall,status,doctor}")
+    hook_p = sub.add_parser("hook")
+    hook_p.add_argument("event", choices=sorted({s for _, _, s in HOOK_EVENTS}))
+    sub.add_parser("update")
+    sub.add_parser("install", help="merge hook stanzas into Claude settings")
+    un = sub.add_parser("uninstall", help="remove hook stanzas")
+    un.add_argument("--purge", action="store_true",
+                    help="also delete the state directory")
+    sub.add_parser("status", help="show tracked sessions")
+    sub.add_parser("doctor", help="check prerequisites")
+    args = parser.parse_args(argv)
+
+    if args.command == "hook":
+        return cmd_hook(args.event)
+    if args.command == "update":
+        try:
+            return cmd_update()
+        except Exception:
+            log(f"update failed: {traceback.format_exc()}")
+            return 0
+    if args.command == "install":
+        return cmd_install()
+    if args.command == "uninstall":
+        return cmd_uninstall(purge=args.purge)
+    if args.command == "status":
+        return cmd_status()
+    if args.command == "doctor":
+        return cmd_doctor()
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
