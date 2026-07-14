@@ -739,22 +739,6 @@ class TestSettingsMerge:
     def test_remove_from_pristine_settings(self):
         assert ghostlight.remove_hooks({"model": "opus"}) == {"model": "opus"}
 
-    def test_merge_migrates_legacy_agentdots_hooks(self):
-        # upgrading from the project's old name must not leave dead stanzas
-        legacy = {"hooks": {"Stop": [
-            {"hooks": [{"type": "command",
-                        "command": "/old/repo/agentdots hook stop"}]}]}}
-        merged = ghostlight.merge_hooks(legacy, "/new/repo/ghostlight")
-        cmds = [h["command"] for st in merged["hooks"]["Stop"]
-                for h in st["hooks"]]
-        assert cmds == ["/new/repo/ghostlight hook stop"]
-
-    def test_remove_strips_legacy_agentdots_hooks(self):
-        legacy = {"hooks": {"Stop": [
-            {"hooks": [{"type": "command",
-                        "command": "/old/repo/agentdots hook stop"}]}]}}
-        assert ghostlight.remove_hooks(legacy) == {}
-
     def test_hook_command_paths_extracts_quoted(self):
         s = ghostlight.merge_hooks({}, "/My Proj/ghostlight")
         assert ghostlight.hook_command_paths(s) == ["/My Proj/ghostlight"]

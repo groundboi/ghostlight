@@ -539,11 +539,8 @@ def cmd_hook(event):
 
 
 def _is_our_hook(command):
-    # tolerant of shlex-quoted paths (e.g. '/My Proj/ghostlight' hook stop);
-    # "agentdots" is the project's pre-rename name, matched so that
-    # install/uninstall migrate legacy stanzas instead of orphaning them
-    return (" hook " in command
-            and ("ghostlight" in command or "agentdots" in command))
+    # tolerant of shlex-quoted paths (e.g. '/My Proj/ghostlight' hook stop)
+    return "ghostlight" in command and " hook " in command
 
 
 def hook_command_paths(settings):
@@ -810,12 +807,12 @@ def main(argv=None):
     hook_p = sub.add_parser("hook")
     hook_p.add_argument("event", choices=sorted({s for _, _, s in HOOK_EVENTS}))
     sub.add_parser("update")
-    sub.add_parser("install", help="merge hook stanzas into Claude settings")
-    un = sub.add_parser("uninstall", help="remove hook stanzas")
+    sub.add_parser("install", help="install ghostlight hook into Claude Code")
+    un = sub.add_parser("uninstall", help="uninstall ghostlight hook from Claude Code")
     un.add_argument("--purge", action="store_true",
                     help="also delete the state directory")
     sub.add_parser("status", help="show tracked sessions")
-    sub.add_parser("doctor", help="check prerequisites")
+    sub.add_parser("doctor", help="check prerequisites and health")
     args = parser.parse_args(argv)
 
     if args.command == "hook":

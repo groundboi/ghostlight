@@ -34,6 +34,8 @@ to be restarted.
 If desired, you can symlink `ghostlight` to get it on your `PATH`, like
 `ln -s /path/to/ghostlight ~/.local/bin/ghostlight`.
 
+Pretty straight-forward to use: run `ghostlight -h` to get started.
+
 ## Non-goals & limitations
 
 - Will not support all operating systems, terminals, or agent harnesses
@@ -50,13 +52,6 @@ state in `~/.local/state/ghostlight/status/` and spawns a short-lived
 (`set_tab_title`). No daemon or launchd processes needed. Which tab a
 session lives in is detected once at session start by writing a nonce to
 the terminal's title and asking Ghostty which terminal has it.
-
-## Commands
-
-    ghostlight status      # tracked sessions and their tabs
-    ghostlight doctor      # environment/permission checks
-    ghostlight update      # force a reconcile (normally automatic)
-    ghostlight uninstall [--purge]
 
 ## Debugging
 
