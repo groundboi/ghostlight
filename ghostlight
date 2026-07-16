@@ -787,10 +787,10 @@ def cmd_doctor():
                         for h in st.get("hooks", []))
             }
         except (TypeError, AttributeError):
-            check(f"{label} hook stanzas in {path} (unreadable structure)",
+            check(f"{label} hooks in {path} (unreadable structure)",
                   False, "run `ghostlight install`")
         else:
-            check(f"{label} hook stanzas in {path} "
+            check(f"{label} hooks in {path} "
                   f"({len(present)}/{len(wanted)} hooks)",
                   present == wanted, "run `ghostlight install`")
 
