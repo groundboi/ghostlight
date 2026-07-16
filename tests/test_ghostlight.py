@@ -20,6 +20,11 @@ class TestScaffold:
         assert ghostlight.state_dir() == state_env
         assert ghostlight.status_dir() == state_env / "status"
 
+    def test_codex_hooks_env_override(self, tmp_path, monkeypatch):
+        path = tmp_path / "codex-hooks.json"
+        monkeypatch.setenv("GHOSTLIGHT_CODEX_HOOKS", str(path))
+        assert ghostlight.codex_hooks_path() == path
+
     def test_log_writes_and_never_raises(self, state_env):
         ghostlight.log("hello")
         assert "hello" in ghostlight.log_path().read_text()
@@ -713,6 +718,15 @@ class TestSettingsMerge:
         # every event from HOOK_EVENTS is present
         assert {ev for ev, _, _ in ghostlight.HOOK_EVENTS} <= set(out["hooks"])
 
+    def test_merge_codex_events(self):
+        out = ghostlight.merge_hooks(
+            {}, self.CMD, ghostlight.CODEX_HOOK_EVENTS)
+        assert "PermissionRequest" in out["hooks"]
+        assert "Notification" not in out["hooks"]
+        assert "SessionEnd" not in out["hooks"]
+        command = out["hooks"]["PermissionRequest"][0]["hooks"][0]["command"]
+        assert command == f"{self.CMD} hook notification"
+
     def test_merge_preserves_user_hooks_and_settings(self):
         settings = {
             "model": "opus",
@@ -827,7 +841,9 @@ class TestInstallCommands:
     @staticmethod
     def _isolate(tmp_path, monkeypatch):
         sp = tmp_path / "settings.json"
+        cp = tmp_path / "codex-hooks.json"
         monkeypatch.setenv("GHOSTLIGHT_SETTINGS", str(sp))
+        monkeypatch.setenv("GHOSTLIGHT_CODEX_HOOKS", str(cp))
         monkeypatch.setattr(ghostlight, "ghostty_version", lambda: (1, 3, 1))
         monkeypatch.setattr(ghostlight, "ghostty_running", lambda: False)
         return sp
@@ -838,15 +854,27 @@ class TestInstallCommands:
         assert ghostlight.cmd_install() == 0
         data = json.loads(sp.read_text())
         assert "SessionStart" in data["hooks"]
+        codex = json.loads((tmp_path / "codex-hooks.json").read_text())
+        assert "PermissionRequest" in codex["hooks"]
+        assert "SessionEnd" not in codex["hooks"]
         assert ghostlight.status_dir().is_dir()
 
     def test_install_backs_up_existing(self, state_env, tmp_path, monkeypatch):
         sp = self._isolate(tmp_path, monkeypatch)
         sp.write_text('{"model": "opus"}')
+        cp = tmp_path / "codex-hooks.json"
+        cp.write_text('{"hooks":{"Stop":[{"hooks":[{"type":"command",'
+                      '"command":"/usr/bin/say done"}]}]}}')
         ghostlight.cmd_install()
         backup = tmp_path / "settings.json.ghostlight-backup"
         assert json.loads(backup.read_text()) == {"model": "opus"}
         assert json.loads(sp.read_text())["model"] == "opus"
+        codex = json.loads(cp.read_text())
+        stop_commands = [hook["command"]
+                         for stanza in codex["hooks"]["Stop"]
+                         for hook in stanza["hooks"]]
+        assert "/usr/bin/say done" in stop_commands
+        assert (tmp_path / "codex-hooks.json.ghostlight-backup").exists()
 
     def test_reinstall_preserves_pristine_backup(
             self, state_env, tmp_path, monkeypatch):
@@ -878,11 +906,23 @@ class TestInstallCommands:
         assert sp.read_text() == content
         assert not (tmp_path / "settings.json.ghostlight-backup").exists()
 
+    def test_install_refuses_invalid_codex_hooks_before_writing_claude(
+            self, state_env, tmp_path, monkeypatch):
+        sp = self._isolate(tmp_path, monkeypatch)
+        sp.write_text('{"model":"opus"}')
+        cp = tmp_path / "codex-hooks.json"
+        cp.write_text('{broken')
+        assert ghostlight.cmd_install() == 1
+        assert json.loads(sp.read_text()) == {"model": "opus"}
+        assert cp.read_text() == "{broken"
+
     def test_uninstall_removes_our_hooks(self, state_env, tmp_path, monkeypatch):
         sp = self._isolate(tmp_path, monkeypatch)
         ghostlight.cmd_install()
         assert ghostlight.cmd_uninstall() == 0
         assert "hooks" not in json.loads(sp.read_text())
+        assert "hooks" not in json.loads(
+            (tmp_path / "codex-hooks.json").read_text())
 
     def test_uninstall_purge_removes_state_dir(
             self, state_env, tmp_path, monkeypatch):
@@ -981,6 +1021,8 @@ class TestCli:
     def test_doctor_all_good(self, state_env, tmp_path, monkeypatch, capsys):
         sp = tmp_path / "settings.json"
         monkeypatch.setenv("GHOSTLIGHT_SETTINGS", str(sp))
+        monkeypatch.setenv("GHOSTLIGHT_CODEX_HOOKS",
+                           str(tmp_path / "codex-hooks.json"))
         monkeypatch.setattr(ghostlight, "ghostty_version", lambda: (1, 3, 1))
         monkeypatch.setattr(ghostlight, "ghostty_running", lambda: True)
         monkeypatch.setattr(ghostlight, "run_osascript", lambda *a: "1.3.1")
@@ -992,6 +1034,8 @@ class TestCli:
                                         monkeypatch, capsys):
         sp = tmp_path / "settings.json"
         monkeypatch.setenv("GHOSTLIGHT_SETTINGS", str(sp))
+        monkeypatch.setenv("GHOSTLIGHT_CODEX_HOOKS",
+                           str(tmp_path / "codex-hooks.json"))
         monkeypatch.setattr(ghostlight, "ghostty_version", lambda: (1, 3, 1))
         monkeypatch.setattr(ghostlight, "ghostty_running", lambda: False)
         assert ghostlight.main(["doctor"]) == 1
@@ -1001,6 +1045,8 @@ class TestCli:
                                                        monkeypatch, capsys):
         sp = tmp_path / "settings.json"
         monkeypatch.setenv("GHOSTLIGHT_SETTINGS", str(sp))
+        monkeypatch.setenv("GHOSTLIGHT_CODEX_HOOKS",
+                           str(tmp_path / "codex-hooks.json"))
         monkeypatch.setattr(ghostlight, "ghostty_version", lambda: (1, 3, 1))
         monkeypatch.setattr(ghostlight, "ghostty_running", lambda: True)
         monkeypatch.setattr(ghostlight, "run_osascript", lambda *a: "1.3.1")
@@ -1017,11 +1063,15 @@ class TestCli:
                                          monkeypatch, capsys):
         sp = tmp_path / "settings.json"
         monkeypatch.setenv("GHOSTLIGHT_SETTINGS", str(sp))
+        cp = tmp_path / "codex-hooks.json"
+        monkeypatch.setenv("GHOSTLIGHT_CODEX_HOOKS", str(cp))
         monkeypatch.setattr(ghostlight, "ghostty_version", lambda: (1, 3, 1))
         monkeypatch.setattr(ghostlight, "ghostty_running", lambda: True)
         monkeypatch.setattr(ghostlight, "run_osascript", lambda *a: "1.3.1")
         sp.write_text(json.dumps(
             ghostlight.merge_hooks({}, "/nonexistent/ghostlight")))
+        cp.write_text(json.dumps(ghostlight.merge_hooks(
+            {}, "/nonexistent/ghostlight", ghostlight.CODEX_HOOK_EVENTS)))
         assert ghostlight.main(["doctor"]) == 1
         out = capsys.readouterr().out
         assert "✗ hook command runnable (/nonexistent/ghostlight)" in out
@@ -1030,6 +1080,8 @@ class TestCli:
             self, state_env, tmp_path, monkeypatch, capsys):
         sp = tmp_path / "settings.json"
         monkeypatch.setenv("GHOSTLIGHT_SETTINGS", str(sp))
+        cp = tmp_path / "codex-hooks.json"
+        monkeypatch.setenv("GHOSTLIGHT_CODEX_HOOKS", str(cp))
         monkeypatch.setattr(ghostlight, "ghostty_version", lambda: (1, 3, 1))
         monkeypatch.setattr(ghostlight, "ghostty_running", lambda: True)
         monkeypatch.setattr(ghostlight, "run_osascript", lambda *a: "1.3.1")
@@ -1037,6 +1089,8 @@ class TestCli:
         other.write_text("#!/bin/sh\n")
         other.chmod(0o755)
         sp.write_text(json.dumps(ghostlight.merge_hooks({}, str(other))))
+        cp.write_text(json.dumps(ghostlight.merge_hooks(
+            {}, str(other), ghostlight.CODEX_HOOK_EVENTS)))
         assert ghostlight.main(["doctor"]) == 0
         out = capsys.readouterr().out
         assert "✗" not in out
@@ -1050,6 +1104,8 @@ class TestCli:
                                                    monkeypatch, capsys, content):
         sp = tmp_path / "settings.json"
         monkeypatch.setenv("GHOSTLIGHT_SETTINGS", str(sp))
+        monkeypatch.setenv("GHOSTLIGHT_CODEX_HOOKS",
+                           str(tmp_path / "codex-hooks.json"))
         monkeypatch.setattr(ghostlight, "ghostty_version", lambda: (1, 3, 1))
         monkeypatch.setattr(ghostlight, "ghostty_running", lambda: False)
         sp.write_text(content)
