@@ -56,9 +56,9 @@ session state in `~/.local/state/ghostlight/status/` and spawn a short-lived
 session lives in is detected once at session start by writing a nonce to
 the terminal's title and asking Ghostty which terminal has it.
 
-Codex does not currently provide a `SessionEnd` hook. After a Codex session's
-tab closes, its state file is cleaned up opportunistically the next time any
-Ghostlight hook triggers an update.
+When a session ends, its `SessionEnd` hook removes the state file. State left
+behind after an abrupt process or terminal exit is cleaned up opportunistically
+the next time any Ghostlight hook triggers an update.
 
 ## Debugging
 

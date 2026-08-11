@@ -723,7 +723,8 @@ class TestSettingsMerge:
             {}, self.CMD, ghostlight.CODEX_HOOK_EVENTS)
         assert "PermissionRequest" in out["hooks"]
         assert "Notification" not in out["hooks"]
-        assert "SessionEnd" not in out["hooks"]
+        assert out["hooks"]["SessionEnd"][0]["hooks"][0]["command"] == \
+            f"{self.CMD} hook session-end"
         command = out["hooks"]["PermissionRequest"][0]["hooks"][0]["command"]
         assert command == f"{self.CMD} hook notification"
 
@@ -856,7 +857,7 @@ class TestInstallCommands:
         assert "SessionStart" in data["hooks"]
         codex = json.loads((tmp_path / "codex-hooks.json").read_text())
         assert "PermissionRequest" in codex["hooks"]
-        assert "SessionEnd" not in codex["hooks"]
+        assert "SessionEnd" in codex["hooks"]
         assert ghostlight.status_dir().is_dir()
 
     def test_install_backs_up_existing(self, state_env, tmp_path, monkeypatch):

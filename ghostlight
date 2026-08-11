@@ -55,9 +55,8 @@ HOOK_EVENTS = [
     ("SessionEnd", None, "session-end"),
 ]
 
-# Codex supports the same payload fields and most of the same lifecycle events.
-# It uses PermissionRequest rather than Claude Code's filtered Notification and
-# does not currently expose a SessionEnd hook.
+# Codex supports the same payload fields and lifecycle events used here. It uses
+# PermissionRequest rather than Claude Code's filtered Notification.
 CODEX_HOOK_EVENTS = [
     ("SessionStart", None, "session-start"),
     ("UserPromptSubmit", None, "user-prompt-submit"),
@@ -66,6 +65,7 @@ CODEX_HOOK_EVENTS = [
     ("PreCompact", None, "precompact"),
     ("PostCompact", None, "postcompact"),
     ("Stop", None, "stop"),
+    ("SessionEnd", None, "session-end"),
 ]
 
 
